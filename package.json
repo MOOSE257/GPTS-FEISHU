@@ -1,0 +1,14 @@
+{
+  "name": "feishu-gpt-bot",
+  "version": "1.0.0",
+  "description": "飞书机器人接入 OpenAI GPT",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "express": "^4.19.2",
+    "body-parser": "^1.20.2"
+  }
+}
