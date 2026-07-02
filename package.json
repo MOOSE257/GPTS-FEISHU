@@ -1,14 +1,17 @@
 {
   "name": "feishu-gpt-bot",
   "version": "1.0.0",
-  "description": "飞书机器人接入 OpenAI GPT",
+  "description": "飞书机器人接入 OpenAI GPT，支持文字回复和图片回传",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "axios": "^1.7.2",
     "express": "^4.19.2",
-    "body-parser": "^1.20.2"
+    "form-data": "^4.0.0"
   }
 }
