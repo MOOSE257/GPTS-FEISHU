@@ -1,9 +1,8 @@
 const express = require('express');
 const axios = require('axios');
-const bodyParser = require('body-parser');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());  // 用 express 自带的，替代 body-parser
 
 // ---------- 内存缓存 ----------
 let cachedTenantToken = { token: '', expire: 0 };
