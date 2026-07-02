@@ -1,12 +1,17 @@
 const express = require('express');
 const axios = require('axios');
+const FormData = require('form-data');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 // ========== 基础配置 ==========
 const PORT = process.env.PORT || 8080;
+
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4-mini';
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2';
+const OPENAI_IMAGE_SIZE = process.env.OPENAI_IMAGE_SIZE || '1024x1024';
+const OPENAI_IMAGE_QUALITY = process.env.OPENAI_IMAGE_QUALITY || 'low';
 
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
@@ -18,7 +23,7 @@ let cachedTenantToken = {
   expire: 0,
 };
 
-// Railway 重启后内存会清空，正式生产建议改数据库
+// Railway 重启后内存会清空，正式生产建议改成数据库
 const historyMap = new Map();
 const processedEvents = new Set();
 
@@ -31,7 +36,10 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'feishu-gpt-bot',
-    model: OPENAI_MODEL,
+    text_model: OPENAI_MODEL,
+    image_model: OPENAI_IMAGE_MODEL,
+    image_size: OPENAI_IMAGE_SIZE,
+    image_quality: OPENAI_IMAGE_QUALITY,
     time: new Date().toISOString(),
   });
 });
@@ -113,7 +121,7 @@ function extractTextFromFeishuContent(rawContent) {
     let text = parsed.text || '';
 
     text = text
-      // 飞书 @ 机器人的格式
+      // 飞书 @ 机器人格式
       .replace(/<at[^>]*><\/at>/g, '')
       // 兼容部分旧格式
       .replace(/@_user_\d+\s*/g, '')
@@ -124,6 +132,29 @@ function extractTextFromFeishuContent(rawContent) {
     console.error('解析飞书消息 content 失败:', err.message, rawContent);
     return '';
   }
+}
+
+// ========== 判断是否是画图请求 ==========
+function isImageRequest(text) {
+  if (!text) return false;
+
+  return (
+    text.startsWith('/image ') ||
+    text.startsWith('画图 ') ||
+    text.startsWith('生成图片 ') ||
+    text.startsWith('出图 ') ||
+    text.startsWith('做图 ')
+  );
+}
+
+function extractImagePrompt(text) {
+  return text
+    .replace(/^\/image\s+/i, '')
+    .replace(/^画图\s+/, '')
+    .replace(/^生成图片\s+/, '')
+    .replace(/^出图\s+/, '')
+    .replace(/^做图\s+/, '')
+    .trim();
 }
 
 // ========== 获取飞书 tenant_access_token ==========
@@ -203,7 +234,7 @@ async function sendFeishuText({
         }
       );
 
-      console.log('飞书私聊发送结果:', JSON.stringify(res.data));
+      console.log('飞书私聊文本发送结果:', JSON.stringify(res.data));
       return res.data;
     }
 
@@ -220,10 +251,10 @@ async function sendFeishuText({
       }
     );
 
-    console.log('飞书群聊回复结果:', JSON.stringify(res.data));
+    console.log('飞书群聊文本回复结果:', JSON.stringify(res.data));
     return res.data;
   } catch (err) {
-    console.error('发送飞书消息失败:', err.response?.data || err.message);
+    console.error('发送飞书文本失败:', err.response?.data || err.message);
     throw err;
   }
 }
@@ -232,12 +263,10 @@ async function sendFeishuText({
 function extractResponsesText(data) {
   if (!data) return '';
 
-  // Responses API 有时会直接返回 output_text
   if (typeof data.output_text === 'string' && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // 标准 output 结构
   if (Array.isArray(data.output)) {
     const texts = [];
 
@@ -312,13 +341,154 @@ async function callOpenAI(sessionId) {
   }
 }
 
-// ========== OpenAI 测试接口 ==========
+// ========== 调用 OpenAI 图片生成 ==========
+async function generateImageWithOpenAI(prompt) {
+  try {
+    console.log('准备调用 OpenAI 图片生成');
+    console.log('图片模型:', OPENAI_IMAGE_MODEL);
+    console.log('图片尺寸:', OPENAI_IMAGE_SIZE);
+    console.log('图片质量:', OPENAI_IMAGE_QUALITY);
+    console.log('图片提示词:', prompt);
+
+    const res = await axios.post(
+      'https://api.openai.com/v1/images/generations',
+      {
+        model: OPENAI_IMAGE_MODEL,
+        prompt,
+        size: OPENAI_IMAGE_SIZE,
+        quality: OPENAI_IMAGE_QUALITY,
+        output_format: 'png',
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 180000,
+      }
+    );
+
+    const b64 = res.data?.data?.[0]?.b64_json;
+
+    if (!b64) {
+      console.error('OpenAI 图片生成返回为空:', JSON.stringify(res.data));
+      throw new Error('OpenAI 没有返回图片 base64');
+    }
+
+    console.log('OpenAI 图片生成成功');
+    return Buffer.from(b64, 'base64');
+  } catch (err) {
+    console.error('OpenAI 图片生成失败状态码:', err.response?.status);
+    console.error('OpenAI 图片生成失败详情:', err.response?.data || err.message);
+    throw err;
+  }
+}
+
+// ========== 上传图片到飞书 ==========
+async function uploadImageToFeishu(imageBuffer) {
+  const token = await getTenantToken();
+
+  const form = new FormData();
+  form.append('image_type', 'message');
+  form.append('image', imageBuffer, {
+    filename: 'openai-image.png',
+    contentType: 'image/png',
+  });
+
+  try {
+    const res = await axios.post(
+      'https://open.feishu.cn/open-apis/im/v1/images',
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...form.getHeaders(),
+        },
+        timeout: 60000,
+      }
+    );
+
+    console.log('飞书图片上传结果:', JSON.stringify(res.data));
+
+    const imageKey = res.data?.data?.image_key;
+
+    if (!imageKey) {
+      throw new Error(`飞书没有返回 image_key: ${JSON.stringify(res.data)}`);
+    }
+
+    return imageKey;
+  } catch (err) {
+    console.error('上传图片到飞书失败:', err.response?.data || err.message);
+    throw err;
+  }
+}
+
+// ========== 发送飞书图片消息 ==========
+async function sendFeishuImage({
+  msgId,
+  openId,
+  chatType,
+  imageKey,
+}) {
+  const token = await getTenantToken();
+
+  const payload = {
+    msg_type: 'image',
+    content: JSON.stringify({
+      image_key: imageKey,
+    }),
+  };
+
+  try {
+    // 私聊：直接发给用户
+    if (chatType === 'p2p') {
+      const res = await axios.post(
+        'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id',
+        {
+          receive_id: openId,
+          ...payload,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 30000,
+        }
+      );
+
+      console.log('飞书私聊图片发送结果:', JSON.stringify(res.data));
+      return res.data;
+    }
+
+    // 群聊：回复原消息
+    const res = await axios.post(
+      `https://open.feishu.cn/open-apis/im/v1/messages/${msgId}/reply`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log('飞书群聊图片回复结果:', JSON.stringify(res.data));
+    return res.data;
+  } catch (err) {
+    console.error('发送飞书图片失败:', err.response?.data || err.message);
+    throw err;
+  }
+}
+
+// ========== OpenAI 文字测试接口 ==========
 app.get('/test-openai', async (req, res) => {
   try {
     const result = await axios.post(
       'https://api.openai.com/v1/responses',
       {
-        model: process.env.OPENAI_MODEL || 'gpt-5.4-mini',
+        model: OPENAI_MODEL,
         input: '请只回复 OK',
         store: false,
         max_output_tokens: 50,
@@ -334,8 +504,32 @@ app.get('/test-openai', async (req, res) => {
 
     res.json({
       ok: true,
-      model: process.env.OPENAI_MODEL || 'gpt-5.4-mini',
+      model: OPENAI_MODEL,
       reply: extractResponsesText(result.data),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      status: err.response?.status || null,
+      error: err.response?.data || err.message,
+    });
+  }
+});
+
+// ========== OpenAI 图片测试接口 ==========
+app.get('/test-image', async (req, res) => {
+  const prompt =
+    req.query.prompt ||
+    '一只橘猫坐在海边，干净的电商风格，方形构图';
+
+  try {
+    const imageBuffer = await generateImageWithOpenAI(prompt);
+    const imageKey = await uploadImageToFeishu(imageBuffer);
+
+    res.json({
+      ok: true,
+      image_key: imageKey,
+      message: '图片已生成并上传到飞书。这个接口只测试上传，不会主动发到飞书聊天。',
     });
   } catch (err) {
     res.status(500).json({
@@ -416,7 +610,7 @@ async function handleFeishuEvent(body) {
       msgId,
       openId,
       chatType,
-      content: '我目前只能处理文本消息。',
+      content: '我目前只能处理文本消息。你可以发送：画图 一只坐在海边的橘猫',
       atUser: true,
     });
     return;
@@ -432,7 +626,56 @@ async function handleFeishuEvent(body) {
 
   const sessionId = chatId || openId;
 
-  // 清空上下文指令
+  // ========== 图片生成指令 ==========
+  if (isImageRequest(userText)) {
+    const imagePrompt = extractImagePrompt(userText);
+
+    if (!imagePrompt) {
+      await sendFeishuText({
+        msgId,
+        openId,
+        chatType,
+        content: '请在画图指令后面输入图片描述，例如：画图 一只坐在海边的橘猫',
+        atUser: true,
+      });
+      return;
+    }
+
+    try {
+      await sendFeishuText({
+        msgId,
+        openId,
+        chatType,
+        content: '正在生成图片，请稍等。',
+        atUser: true,
+      });
+
+      const imageBuffer = await generateImageWithOpenAI(imagePrompt);
+      const imageKey = await uploadImageToFeishu(imageBuffer);
+
+      await sendFeishuImage({
+        msgId,
+        openId,
+        chatType,
+        imageKey,
+      });
+
+      console.log('图片生成并发送完成');
+    } catch (err) {
+      await sendFeishuText({
+        msgId,
+        openId,
+        chatType,
+        content:
+          '图片生成或发送失败，请检查 OpenAI 图片模型权限、API 额度、飞书图片上传权限，以及 Railway Runtime Logs。',
+        atUser: true,
+      });
+    }
+
+    return;
+  }
+
+  // ========== 清空上下文指令 ==========
   if (
     userText === '/clear' ||
     userText === '清空上下文' ||
@@ -451,7 +694,7 @@ async function handleFeishuEvent(body) {
     return;
   }
 
-  // 保存用户消息
+  // ========== 保存用户消息 ==========
   const history = getHistory(sessionId);
   history.push({
     role: 'user',
@@ -468,7 +711,7 @@ async function handleFeishuEvent(body) {
       'OpenAI 调用失败，请检查 Railway 的 OPENAI_API_KEY、OPENAI_MODEL、API 账户额度，以及 Runtime Logs。';
   }
 
-  // 保存 AI 回复
+  // ========== 保存 AI 回复 ==========
   const updatedHistory = getHistory(sessionId);
   updatedHistory.push({
     role: 'assistant',
@@ -476,7 +719,7 @@ async function handleFeishuEvent(body) {
   });
   saveHistory(sessionId, updatedHistory);
 
-  // 分段发送，避免飞书单条消息过长
+  // ========== 分段发送，避免飞书单条消息过长 ==========
   const chunks = splitText(aiReply, 1800);
 
   for (let i = 0; i < chunks.length; i++) {
@@ -489,7 +732,7 @@ async function handleFeishuEvent(body) {
     });
   }
 
-  console.log('本次消息处理完成');
+  console.log('本次文字消息处理完成');
 }
 
 // ========== 飞书事件入口 ==========
